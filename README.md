@@ -4,7 +4,7 @@ Mirror layar Android ke PC secara nirkabel menggunakan ADB over WiFi, dengan tam
 
 ![status](https://img.shields.io/badge/status-active-brightgreen) ![python](https://img.shields.io/badge/python-3.8%2B-blue)
 
-## ✨ Fitur
+## Fitur
 
 - Mirroring layar Android secara real-time lewat ADB Wireless (tanpa kabel USB)
 - Tampilan terminal hijau ala hacker dengan logging berwarna
@@ -19,7 +19,7 @@ Mirror layar Android ke PC secara nirkabel menggunakan ADB over WiFi, dengan tam
 - Android device dengan **Wireless debugging** aktif (Developer Options)
 - Koneksi WiFi yang sama antara PC dan device
 
-## 🚀 Instalasi
+## Instalasi
 
 ```bash
 git clone https://github.com/<username>/anonymsh.git
@@ -33,7 +33,7 @@ Kalau muncul error `externally-managed-environment` (Debian/Kali/Ubuntu terbaru)
 pip install -r requirements.txt --break-system-packages
 ```
 
-## 🔧 Persiapan Wireless ADB
+## Persiapan Wireless ADB
 
 1. Di HP: **Settings → Developer Options → Wireless debugging** → aktifkan
 2. Pairing pertama kali:
@@ -52,7 +52,7 @@ pip install -r requirements.txt --break-system-packages
 
 > **Catatan untuk device Xiaomi/Redmi/POCO (MIUI/HyperOS):** aktifkan juga toggle **"USB debugging (Security settings)"** di Developer Options, terpisah dari toggle "USB debugging" biasa. Tanpa ini, perintah seperti `screencap` bisa gagal diam-diam.
 
-## ▶️ Menjalankan
+## Menjalankan
 
 ```bash
 python3 anonymsh.py
@@ -60,7 +60,7 @@ python3 anonymsh.py
 
 Tekan `q` di jendela video untuk keluar.
 
-## 🐛 Troubleshooting
+## Troubleshooting
 
 | Gejala | Kemungkinan Penyebab | Solusi |
 |---|---|---|

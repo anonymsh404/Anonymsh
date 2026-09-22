@@ -121,110 +121,187 @@ def check_wireless_adb():
     return device_serial
 
 
-def capture_screen(timeout=60.0):
-    """
-    Mengambil screenshot via adb exec-out screencap -p.
-    Mengembalikan (frame, error_message).
-    Catatan: di device beresolusi tinggi + WiFi lambat, satu capture
-    bisa makan waktu puluhan detik. timeout default dinaikkan supaya
-    tidak dianggap 'gagal' padahal cuma lambat.
-    """
+def get_device_screen_size():
+    """Ambil resolusi asli layar device via 'adb shell wm size'."""
     try:
-        process = subprocess.run(
-            ["adb", "exec-out", "screencap", "-p"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        return None, f"timeout {timeout:.0f}s (koneksi WiFi lemot / resolusi device tinggi)"
-    except FileNotFoundError:
-        return None, "adb tidak ditemukan"
+        result = subprocess.run(["adb", "shell", "wm", "size"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, timeout=10)
+    except Exception:
+        return None
 
-    if process.returncode != 0:
-        err = process.stderr.decode(errors="ignore").strip()
-        return None, f"adb error: {err or 'unknown'}"
+    text = result.stdout
+    # Prioritaskan "Override size" kalau ada, fallback ke "Physical size"
+    override = None
+    physical = None
+    for line in text.splitlines():
+        if "Override size:" in line:
+            override = line.split(":")[1].strip()
+        elif "Physical size:" in line:
+            physical = line.split(":")[1].strip()
 
-    if not process.stdout:
-        return None, "stdout kosong (kemungkinan device sleep/layar mati)"
+    size_str = override or physical
+    if not size_str or "x" not in size_str:
+        return None
 
-    raw = np.frombuffer(process.stdout, dtype="uint8")
-    image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-
-    if image is None:
-        return None, "gagal decode PNG (data korup / terpotong saat transfer WiFi)"
-
-    return image, None
+    try:
+        w, h = size_str.lower().split("x")
+        return int(w), int(h)
+    except ValueError:
+        return None
 
 
-class CaptureWorker:
+def compute_stream_size(native_w, native_h, max_dimension=720):
+    """Hitung ukuran streaming yang di-downscale, tetap menjaga aspect ratio,
+    dan dibulatkan ke angka genap (disyaratkan encoder H.264)."""
+    if native_w >= native_h:
+        scale = max_dimension / native_w
+    else:
+        scale = max_dimension / native_h
+    scale = min(scale, 1.0)
+    w = int(native_w * scale)
+    h = int(native_h * scale)
+    w -= w % 2
+    h -= h % 2
+    return max(w, 2), max(h, 2)
+
+
+class StreamWorker:
     """
-    Menjalankan capture_screen() di thread terpisah secara terus-menerus,
-    supaya jendela video tetap hidup & responsif walau satu capture
-    butuh waktu lama (device resolusi tinggi via WiFi lambat).
+    Meniru cara kerja scrcpy: menjalankan 'adb shell screenrecord' yang
+    encode video H.264 langsung di device (jauh lebih ringan lewat WiFi
+    dibanding screenshot PNG berulang), lalu men-decode stream tersebut
+    lewat ffmpeg menjadi frame mentah (BGR) yang bisa ditampilkan OpenCV.
+
+    Berjalan sebagai thread terpisah supaya window video tetap responsif.
+    'screenrecord' punya batas waktu per sesi di banyak versi Android,
+    jadi worker ini otomatis me-restart pipeline kalau stream berhenti.
     """
 
-    def __init__(self, capture_timeout=60.0):
-        self.capture_timeout = capture_timeout
+    def __init__(self, max_dimension=720, bit_rate="8M"):
+        self.max_dimension = max_dimension
+        self.bit_rate = bit_rate
         self.lock = threading.Lock()
         self.latest_frame = None
-        self.latest_error = None
         self.last_update_time = None
-        self.is_capturing = False
-        self.consecutive_failures = 0
+        self.is_connecting = True
+        self.status_message = "Menghubungkan..."
+        self.error = None
         self._stop = False
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._adb_proc = None
+        self._ffmpeg_proc = None
 
     def start(self):
         self._thread.start()
 
     def stop(self):
         self._stop = True
+        self._kill_procs()
+
+    def _kill_procs(self):
+        for proc in (self._ffmpeg_proc, self._adb_proc):
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _set_status(self, msg, connecting=True):
+        with self.lock:
+            self.status_message = msg
+            self.is_connecting = connecting
 
     def _run(self):
         while not self._stop:
-            with self.lock:
-                self.is_capturing = True
-            frame, err = capture_screen(timeout=self.capture_timeout)
-            with self.lock:
-                self.is_capturing = False
-                if frame is not None:
-                    self.latest_frame = frame
-                    self.latest_error = None
+            try:
+                self._stream_once()
+            except Exception as e:
+                with self.lock:
+                    self.error = str(e)
+            if self._stop:
+                break
+            self._set_status("Stream terputus, menyambung ulang...", connecting=True)
+            time.sleep(1.0)
+
+    def _stream_once(self):
+        self._set_status("Membaca resolusi device...", connecting=True)
+        size = get_device_screen_size()
+        if size is None:
+            self._set_status("Gagal baca resolusi device (adb shell wm size gagal)", connecting=True)
+            time.sleep(2.0)
+            return
+
+        native_w, native_h = size
+        stream_w, stream_h = compute_stream_size(native_w, native_h, self.max_dimension)
+        frame_size = stream_w * stream_h * 3  # BGR24 = 3 byte per piksel
+
+        self._set_status(f"Menghubungkan stream {stream_w}x{stream_h}...", connecting=True)
+
+        # 1) adb: encode layar device jadi H.264 mentah, stream ke stdout
+        adb_cmd = [
+            "adb", "exec-out", "screenrecord",
+            "--output-format=h264",
+            f"--size={stream_w}x{stream_h}",
+            f"--bit-rate={self.bit_rate}",
+            "-"
+        ]
+        self._adb_proc = subprocess.Popen(
+            adb_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+
+        # 2) ffmpeg: decode H.264 -> frame mentah BGR24
+        ffmpeg_cmd = [
+            "ffmpeg", "-loglevel", "quiet",
+            "-f", "h264", "-i", "pipe:0",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-an", "-sn", "pipe:1"
+        ]
+        self._ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=self._adb_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL
+        )
+
+        self._set_status("Live", connecting=False)
+
+        buffer = b""
+        pipe = self._ffmpeg_proc.stdout
+        while not self._stop:
+            chunk = pipe.read(frame_size - len(buffer))
+            if not chunk:
+                break  # stream berakhir (screenrecord kena limit waktu / device disconnect)
+            buffer += chunk
+            if len(buffer) >= frame_size:
+                frame = np.frombuffer(buffer[:frame_size], dtype="uint8").reshape((stream_h, stream_w, 3))
+                with self.lock:
+                    self.latest_frame = frame.copy()
                     self.last_update_time = time.time()
-                    self.consecutive_failures = 0
-                else:
-                    self.latest_error = err
-                    self.consecutive_failures += 1
+                    self.error = None
+                buffer = b""
+
+        self._kill_procs()
 
     def snapshot(self):
-        """Ambil salinan state terbaru secara thread-safe."""
         with self.lock:
             return (
                 self.latest_frame.copy() if self.latest_frame is not None else None,
-                self.latest_error,
                 self.last_update_time,
-                self.is_capturing,
-                self.consecutive_failures,
+                self.is_connecting,
+                self.status_message,
+                self.error,
             )
-
-
-def resize_keep_aspect(frame, target_height=960):
-    h, w = frame.shape[:2]
-    scale = target_height / h
-    new_w = int(w * scale)
-    return cv2.resize(frame, (new_w, target_height), interpolation=cv2.INTER_AREA)
 
 
 SPINNER_FRAMES = ["|", "/", "-", "\\"]
 
 
-def draw_hacker_hud(frame, resolution_text, is_capturing, last_update_time, consecutive_failures):
+def draw_hacker_hud(frame, fps, is_connecting, status_message):
     """Overlay HUD hijau ala hacker di atas frame video."""
     h, w = frame.shape[:2]
     overlay = frame.copy()
 
-    # Bar atas semi transparan
     cv2.rectangle(overlay, (0, 0), (w, 40), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
 
@@ -232,39 +309,22 @@ def draw_hacker_hud(frame, resolution_text, is_capturing, last_update_time, cons
     yellow = (60, 220, 255)
     red = (40, 40, 255)
 
-    cv2.putText(frame, "ANONYMSH LIVE", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, green, 1, cv2.LINE_AA)
-
-    # Status capturing (spinner) di tengah
-    if is_capturing:
+    if is_connecting:
         spin = SPINNER_FRAMES[int(time.time() * 4) % len(SPINNER_FRAMES)]
-        status_text = f"{spin} MENGAMBIL FRAME BARU..."
-        status_color = yellow
-    elif consecutive_failures > 0:
-        status_text = f"! GAGAL {consecutive_failures}x BERTURUT-TURUT"
-        status_color = red
+        cv2.circle(frame, (18, 20), 6, yellow, -1)
+        cv2.putText(frame, f"{spin} {status_message}", (30, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, yellow, 1, cv2.LINE_AA)
     else:
-        status_text = "STANDBY"
-        status_color = green
+        # REC indicator berkedip saat live
+        if int(time.time() * 2) % 2 == 0:
+            cv2.circle(frame, (18, 20), 6, red, -1)
+        cv2.putText(frame, "LIVE", (30, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, green, 1, cv2.LINE_AA)
 
-    (stw, _), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv2.putText(frame, status_text, ((w - stw) // 2, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1, cv2.LINE_AA)
-
-    # Info kanan: waktu sekarang + kapan terakhir update + resolusi
-    ts = datetime.now().strftime("%H:%M:%S")
-    if last_update_time is not None:
-        age = time.time() - last_update_time
-        age_text = f"update {age:.0f}s lalu"
-    else:
-        age_text = "belum ada frame"
-    text_right = f"{ts}  |  {age_text}  |  {resolution_text}"
+    text_right = f"{datetime.now().strftime('%H:%M:%S')}  |  {fps:.1f} FPS  |  {w}x{h}"
     (tw, th), _ = cv2.getTextSize(text_right, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     cv2.putText(frame, text_right, (w - tw - 12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, green, 1, cv2.LINE_AA)
 
-    # Garis scan hijau tipis di bawah bar
-    cv2.line(frame, (0, 40), (w, 40), green, 1)
-
-    # Border tipis di sekeliling frame (kuning kalau lagi capturing, hijau kalau standby)
-    border_color = yellow if is_capturing else green
+    border_color = yellow if is_connecting else green
+    cv2.line(frame, (0, 40), (w, 40), border_color, 1)
     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_color, 1)
 
     return frame
@@ -274,47 +334,46 @@ def main():
     banner()
     check_wireless_adb()
 
+    if shutil.which("ffmpeg") is None:
+        log("FATAL", "ffmpeg tidak ditemukan. Install dulu: sudo apt install ffmpeg", RED)
+        sys.exit(1)
+
     input(f"{YELLOW}Tekan [ENTER] untuk meluncurkan ANONYMSH Wireless Stream...{RESET}")
-    log("BOOT", "Menjalankan stream nirkabel... tekan 'q' di jendela video untuk keluar.", CYAN)
+    log("BOOT", "Menjalankan stream nirkabel (mode scrcpy-like)... tekan 'q' untuk keluar.", CYAN)
     print()
 
     window_name = "ANONYMSH - Wireless Live Screen"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 540, 960)
+    cv2.resizeWindow(window_name, 480, 854)
 
-    worker = CaptureWorker(capture_timeout=60.0)
+    worker = StreamWorker(max_dimension=720, bit_rate="8M")
     worker.start()
 
-    last_resolution_text = "N/A"
-    last_logged_failures = 0
-    last_window_size = (540, 960)
-    placeholder = np.zeros((960, 540, 3), dtype="uint8")
+    last_window_size = (480, 854)
+    placeholder = np.zeros((854, 480, 3), dtype="uint8")
+    last_frame_time = time.time()
+    fps = 0.0
 
     try:
         while True:
-            frame, err, last_update_time, is_capturing, consecutive_failures = worker.snapshot()
-
-            if consecutive_failures > 0 and consecutive_failures != last_logged_failures:
-                log("WARN", f"Gagal ambil frame: {err} (gagal berturut-turut: {consecutive_failures})", YELLOW)
-                last_logged_failures = consecutive_failures
+            frame, last_update_time, is_connecting, status_message, error = worker.snapshot()
+            now = time.time()
 
             if frame is not None:
-                orig_h, orig_w = frame.shape[:2]
-                last_resolution_text = f"{orig_w}x{orig_h}"
-                display = resize_keep_aspect(frame, target_height=960)
+                dt = now - last_frame_time
+                last_frame_time = now
+                if 0 < dt < 1.0:
+                    fps = (fps * 0.9) + ((1.0 / dt) * 0.1)
+                display = frame
             else:
                 display = placeholder.copy()
-                text = "Menunggu frame pertama..."
-                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                text = status_message
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
                 cv2.putText(display, text, ((display.shape[1] - tw) // 2, display.shape[0] // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 255, 60), 1, cv2.LINE_AA)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 220, 255), 1, cv2.LINE_AA)
 
-            frame_hud = draw_hacker_hud(display, last_resolution_text, is_capturing,
-                                         last_update_time, consecutive_failures)
+            frame_hud = draw_hacker_hud(display, fps, is_connecting, status_message)
 
-            # Samakan ukuran window dengan konten HANYA kalau dimensinya beda
-            # dari sebelumnya (misal saat resolusi asli device baru diketahui),
-            # supaya tidak override kalau user sudah resize window manual.
             current_size = (frame_hud.shape[1], frame_hud.shape[0])
             if current_size != last_window_size:
                 cv2.resizeWindow(window_name, current_size[0], current_size[1])
@@ -322,9 +381,7 @@ def main():
 
             cv2.imshow(window_name, frame_hud)
 
-            # waitKey dipanggil tiap ~30ms supaya GUI tetap responsif walau
-            # capture di background sedang lambat
-            if cv2.waitKey(30) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 log("EXIT", "Menutup ANONYMSH...", RED)
                 break
 

@@ -280,46 +280,58 @@ def main():
 
     window_name = "ANONYMSH - Wireless Live Screen"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 540, 960)
 
-    consecutive_failures = 0
-    max_failures_before_warning = 20
-    last_frame_time = time.time()
-    fps = 0.0
+    worker = CaptureWorker(capture_timeout=60.0)
+    worker.start()
+
     last_resolution_text = "N/A"
+    last_logged_failures = 0
+    last_window_size = (540, 960)
+    placeholder = np.zeros((960, 540, 3), dtype="uint8")
 
     try:
         while True:
-            frame, err = capture_screen(timeout=2.0)
-            now = time.time()
+            frame, err, last_update_time, is_capturing, consecutive_failures = worker.snapshot()
+
+            if consecutive_failures > 0 and consecutive_failures != last_logged_failures:
+                log("WARN", f"Gagal ambil frame: {err} (gagal berturut-turut: {consecutive_failures})", YELLOW)
+                last_logged_failures = consecutive_failures
 
             if frame is not None:
-                consecutive_failures = 0
-
-                dt = now - last_frame_time
-                last_frame_time = now
-                if dt > 0:
-                    fps = (fps * 0.8) + ((1.0 / dt) * 0.2)  # smoothing
-
                 orig_h, orig_w = frame.shape[:2]
                 last_resolution_text = f"{orig_w}x{orig_h}"
-
-                frame_resized = resize_keep_aspect(frame, target_height=960)
-                frame_hud = draw_hacker_hud(frame_resized, fps, last_resolution_text)
-
-                cv2.imshow(window_name, frame_hud)
+                display = resize_keep_aspect(frame, target_height=960)
             else:
-                consecutive_failures += 1
-                if consecutive_failures == 1 or consecutive_failures % max_failures_before_warning == 0:
-                    log("WARN", f"Gagal ambil frame: {err} (gagal berturut-turut: {consecutive_failures})", YELLOW)
-                time.sleep(0.15)
+                display = placeholder.copy()
+                text = "Menunggu frame pertama..."
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                cv2.putText(display, text, ((display.shape[1] - tw) // 2, display.shape[0] // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 255, 60), 1, cv2.LINE_AA)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            frame_hud = draw_hacker_hud(display, last_resolution_text, is_capturing,
+                                         last_update_time, consecutive_failures)
+
+            # Samakan ukuran window dengan konten HANYA kalau dimensinya beda
+            # dari sebelumnya (misal saat resolusi asli device baru diketahui),
+            # supaya tidak override kalau user sudah resize window manual.
+            current_size = (frame_hud.shape[1], frame_hud.shape[0])
+            if current_size != last_window_size:
+                cv2.resizeWindow(window_name, current_size[0], current_size[1])
+                last_window_size = current_size
+
+            cv2.imshow(window_name, frame_hud)
+
+            # waitKey dipanggil tiap ~30ms supaya GUI tetap responsif walau
+            # capture di background sedang lambat
+            if cv2.waitKey(30) & 0xFF == ord('q'):
                 log("EXIT", "Menutup ANONYMSH...", RED)
                 break
 
     except KeyboardInterrupt:
         log("EXIT", "Dihentikan oleh user (Ctrl+C).", RED)
     finally:
+        worker.stop()
         cv2.destroyAllWindows()
 
 

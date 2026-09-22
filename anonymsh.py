@@ -6,6 +6,7 @@ import os
 import time
 import shutil
 import random
+import threading
 from datetime import datetime
 
 # ============================================================
@@ -120,10 +121,13 @@ def check_wireless_adb():
     return device_serial
 
 
-def capture_screen(timeout=2.0):
+def capture_screen(timeout=60.0):
     """
     Mengambil screenshot via adb exec-out screencap -p.
     Mengembalikan (frame, error_message).
+    Catatan: di device beresolusi tinggi + WiFi lambat, satu capture
+    bisa makan waktu puluhan detik. timeout default dinaikkan supaya
+    tidak dianggap 'gagal' padahal cuma lambat.
     """
     try:
         process = subprocess.run(
@@ -133,7 +137,7 @@ def capture_screen(timeout=2.0):
             timeout=timeout
         )
     except subprocess.TimeoutExpired:
-        return None, "timeout saat mengambil frame (koneksi WiFi lemot?)"
+        return None, f"timeout {timeout:.0f}s (koneksi WiFi lemot / resolusi device tinggi)"
     except FileNotFoundError:
         return None, "adb tidak ditemukan"
 
@@ -153,6 +157,58 @@ def capture_screen(timeout=2.0):
     return image, None
 
 
+class CaptureWorker:
+    """
+    Menjalankan capture_screen() di thread terpisah secara terus-menerus,
+    supaya jendela video tetap hidup & responsif walau satu capture
+    butuh waktu lama (device resolusi tinggi via WiFi lambat).
+    """
+
+    def __init__(self, capture_timeout=60.0):
+        self.capture_timeout = capture_timeout
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.latest_error = None
+        self.last_update_time = None
+        self.is_capturing = False
+        self.consecutive_failures = 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+
+    def _run(self):
+        while not self._stop:
+            with self.lock:
+                self.is_capturing = True
+            frame, err = capture_screen(timeout=self.capture_timeout)
+            with self.lock:
+                self.is_capturing = False
+                if frame is not None:
+                    self.latest_frame = frame
+                    self.latest_error = None
+                    self.last_update_time = time.time()
+                    self.consecutive_failures = 0
+                else:
+                    self.latest_error = err
+                    self.consecutive_failures += 1
+
+    def snapshot(self):
+        """Ambil salinan state terbaru secara thread-safe."""
+        with self.lock:
+            return (
+                self.latest_frame.copy() if self.latest_frame is not None else None,
+                self.latest_error,
+                self.last_update_time,
+                self.is_capturing,
+                self.consecutive_failures,
+            )
+
+
 def resize_keep_aspect(frame, target_height=960):
     h, w = frame.shape[:2]
     scale = target_height / h
@@ -160,7 +216,10 @@ def resize_keep_aspect(frame, target_height=960):
     return cv2.resize(frame, (new_w, target_height), interpolation=cv2.INTER_AREA)
 
 
-def draw_hacker_hud(frame, fps, resolution_text, rec_on=True):
+SPINNER_FRAMES = ["|", "/", "-", "\\"]
+
+
+def draw_hacker_hud(frame, resolution_text, is_capturing, last_update_time, consecutive_failures):
     """Overlay HUD hijau ala hacker di atas frame video."""
     h, w = frame.shape[:2]
     overlay = frame.copy()
@@ -170,25 +229,43 @@ def draw_hacker_hud(frame, fps, resolution_text, rec_on=True):
     frame = cv2.addWeighted(overlay, 0.55, frame, 0.45, 0)
 
     green = (60, 255, 60)
+    yellow = (60, 220, 255)
     red = (40, 40, 255)
 
-    # REC indicator berkedip
-    if rec_on and int(time.time() * 2) % 2 == 0:
-        cv2.circle(frame, (18, 20), 6, red, -1)
-        cv2.putText(frame, "REC", (30, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, red, 1, cv2.LINE_AA)
+    cv2.putText(frame, "ANONYMSH LIVE", (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, green, 1, cv2.LINE_AA)
 
-    cv2.putText(frame, "ANONYMSH LIVE", (85, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, green, 1, cv2.LINE_AA)
+    # Status capturing (spinner) di tengah
+    if is_capturing:
+        spin = SPINNER_FRAMES[int(time.time() * 4) % len(SPINNER_FRAMES)]
+        status_text = f"{spin} MENGAMBIL FRAME BARU..."
+        status_color = yellow
+    elif consecutive_failures > 0:
+        status_text = f"! GAGAL {consecutive_failures}x BERTURUT-TURUT"
+        status_color = red
+    else:
+        status_text = "STANDBY"
+        status_color = green
 
+    (stw, _), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    cv2.putText(frame, status_text, ((w - stw) // 2, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1, cv2.LINE_AA)
+
+    # Info kanan: waktu sekarang + kapan terakhir update + resolusi
     ts = datetime.now().strftime("%H:%M:%S")
-    text_right = f"{ts}  |  {fps:.1f} FPS  |  {resolution_text}"
+    if last_update_time is not None:
+        age = time.time() - last_update_time
+        age_text = f"update {age:.0f}s lalu"
+    else:
+        age_text = "belum ada frame"
+    text_right = f"{ts}  |  {age_text}  |  {resolution_text}"
     (tw, th), _ = cv2.getTextSize(text_right, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     cv2.putText(frame, text_right, (w - tw - 12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, green, 1, cv2.LINE_AA)
 
     # Garis scan hijau tipis di bawah bar
     cv2.line(frame, (0, 40), (w, 40), green, 1)
 
-    # Border tipis di sekeliling frame
-    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), green, 1)
+    # Border tipis di sekeliling frame (kuning kalau lagi capturing, hijau kalau standby)
+    border_color = yellow if is_capturing else green
+    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), border_color, 1)
 
     return frame
 

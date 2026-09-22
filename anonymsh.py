@@ -58,8 +58,37 @@ def banner():
     print(RESET, end="")
     print(f"{DIM}{GREEN}{'═' * width}{RESET}")
     print(f"{BRIGHT_GREEN}{BOLD}   [ ANONYMSH ]{RESET}{GREEN} :: Wireless Android Screen Mirroring{RESET}")
-    print(f"{DIM}{GREEN}   build: v2.0-hacker  |  mode: ADB-over-WiFi  |  status: STANDBY{RESET}")
+    print(f"{DIM}{GREEN}   v2.0-hacker  |  by anonymsh404  |  github.com/anonymsh404/Anonymsh{RESET}")
     print(f"{DIM}{GREEN}{'═' * width}{RESET}\n")
+
+
+def get_device_info(serial):
+    """Ambil info ringkas device (merk, model, versi Android) ala scrcpy."""
+    def prop(name):
+        try:
+            r = subprocess.run(["adb", "-s", serial, "shell", "getprop", name],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=5)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
+    manufacturer = prop("ro.product.manufacturer").capitalize()
+    model = prop("ro.product.model")
+    android_ver = prop("ro.build.version.release")
+
+    name = " ".join(p for p in [manufacturer, model] if p) or "Unknown Device"
+    if android_ver:
+        name += f" (Android {android_ver})"
+    return name
+
+
+def print_device_info(serial):
+    width = max(65, min(term_width(), 90))
+    device_name = get_device_info(serial)
+    print(f"{DIM}{GREEN}{'─' * width}{RESET}")
+    print(f"{GREEN}   Device: {BRIGHT_GREEN}{BOLD}{device_name}{RESET}{GREEN}   |   Serial: {serial}{RESET}")
+    print(f"{DIM}{GREEN}{'─' * width}{RESET}\n")
 
 
 def log(tag, msg, color=GREEN):
@@ -68,7 +97,7 @@ def log(tag, msg, color=GREEN):
 
 
 def check_wireless_adb():
-    log("SCAN", "Memeriksa status koneksi ADB Nirkabel...", CYAN)
+    log("SCAN", "Memeriksa status koneksi ADB...", CYAN)
     try:
         result = subprocess.run(["adb", "devices"], stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, timeout=10)
@@ -83,48 +112,57 @@ def check_wireless_adb():
     print(f"{DIM}{result.stdout}{RESET}")
 
     lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
-    device_serial = None
-    device_status = None
+    devices = []  # list of (serial, status)
 
     for line in lines[1:]:  # skip header "List of devices attached"
         parts = line.split()
         if len(parts) >= 2:
-            serial, status = parts[0], parts[1]
-            device_serial = serial
-            device_status = status
-            break  # ambil device pertama yang terdeteksi
+            devices.append((parts[0], parts[1]))
 
-    if device_serial is None:
+    if not devices:
         log("ERROR", "Tidak ada perangkat ADB yang terdeteksi sama sekali!", RED)
-        log("HINT", "Pastikan sudah pairing & connect, contoh:", YELLOW)
+        log("HINT", "Sambungkan lewat USB, atau pairing/connect WiFi, contoh:", YELLOW)
         log("HINT", "    adb pair <IP>:<PORT>", YELLOW)
         log("HINT", "    adb connect <IP>:<PORT>", YELLOW)
         sys.exit(1)
 
-    if device_status == "unauthorized":
-        log("ERROR", f"Device {device_serial} berstatus UNAUTHORIZED.", RED)
-        log("HINT", "Cek layar HP kamu, pasti ada popup 'Allow USB/Wireless debugging?' "
-                     "yang belum di-tap Allow.", YELLOW)
+    ready_devices = [(s, st) for s, st in devices if st == "device"]
+
+    if not ready_devices:
+        # Semua device yang terdeteksi statusnya bermasalah
+        serial, status = devices[0]
+        if status == "unauthorized":
+            log("ERROR", f"Device {serial} berstatus UNAUTHORIZED.", RED)
+            log("HINT", "Cek layar HP kamu, pasti ada popup 'Allow debugging?' "
+                         "yang belum di-tap Allow.", YELLOW)
+        elif status == "offline":
+            log("ERROR", f"Device {serial} berstatus OFFLINE.", RED)
+            log("HINT", "Koneksi terputus. Coba 'adb disconnect' lalu 'adb connect <IP>:<PORT>' lagi "
+                         "(atau cabut-pasang ulang kalau USB).", YELLOW)
+        else:
+            log("ERROR", f"Device {serial} status tidak dikenal: {status}", RED)
         sys.exit(1)
 
-    if device_status == "offline":
-        log("ERROR", f"Device {device_serial} berstatus OFFLINE.", RED)
-        log("HINT", "Koneksi WiFi putus. Coba 'adb disconnect' lalu 'adb connect <IP>:<PORT>' lagi.", YELLOW)
-        sys.exit(1)
+    if len(ready_devices) == 1:
+        chosen_serial = ready_devices[0][0]
+    else:
+        # Lebih dari satu device siap pakai (misal USB + WiFi bersamaan).
+        # Prioritaskan yang BUKAN format IP:PORT (biasanya USB), karena
+        # USB jauh lebih stabil & cepat dibanding WiFi untuk streaming.
+        usb_like = [s for s, st in ready_devices if ":" not in s]
+        chosen_serial = usb_like[0] if usb_like else ready_devices[0][0]
+        log("INFO", f"Ada {len(ready_devices)} device aktif, otomatis pilih: {chosen_serial}"
+                     f"{' (prioritas USB)' if usb_like else ''}", CYAN)
 
-    if device_status != "device":
-        log("ERROR", f"Device {device_serial} status tidak dikenal: {device_status}", RED)
-        sys.exit(1)
-
-    log("OK", f"Terhubung ke perangkat: {BRIGHT_GREEN}{device_serial}{RESET}{GREEN} (status: {device_status})", GREEN)
+    log("OK", f"Terhubung ke perangkat: {BRIGHT_GREEN}{chosen_serial}{RESET}{GREEN} (status: device)", GREEN)
     print()
-    return device_serial
+    return chosen_serial
 
 
-def get_device_screen_size():
+def get_device_screen_size(serial):
     """Ambil resolusi asli layar device via 'adb shell wm size'."""
     try:
-        result = subprocess.run(["adb", "shell", "wm", "size"],
+        result = subprocess.run(["adb", "-s", serial, "shell", "wm", "size"],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  text=True, timeout=10)
     except Exception:
@@ -166,6 +204,20 @@ def compute_stream_size(native_w, native_h, max_dimension=720):
     return max(w, 2), max(h, 2)
 
 
+def _drain_stderr(proc, buffer_list, max_lines=30):
+    """Baca stderr sebuah proses di thread terpisah, simpan beberapa baris
+    terakhir untuk diagnosa kalau proses gagal/berhenti tanpa sebab jelas."""
+    try:
+        for line in iter(proc.stderr.readline, b""):
+            text = line.decode(errors="ignore").rstrip()
+            if text:
+                buffer_list.append(text)
+                if len(buffer_list) > max_lines:
+                    buffer_list.pop(0)
+    except Exception:
+        pass
+
+
 class StreamWorker:
     """
     Meniru cara kerja scrcpy: menjalankan 'adb shell screenrecord' yang
@@ -178,9 +230,10 @@ class StreamWorker:
     jadi worker ini otomatis me-restart pipeline kalau stream berhenti.
     """
 
-    def __init__(self, max_dimension=720, bit_rate="8M"):
+    def __init__(self, serial, max_dimension=720, bit_rate=8_000_000):
+        self.serial = serial
         self.max_dimension = max_dimension
-        self.bit_rate = bit_rate
+        self.bit_rate = bit_rate  # angka murni (bits per second), BUKAN format "8M"
         self.lock = threading.Lock()
         self.latest_frame = None
         self.last_update_time = None
@@ -191,6 +244,7 @@ class StreamWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._adb_proc = None
         self._ffmpeg_proc = None
+        self.connect_start_time = None
 
     def start(self):
         self._thread.start()
@@ -202,6 +256,13 @@ class StreamWorker:
     def _kill_procs(self):
         for proc in (self._ffmpeg_proc, self._adb_proc):
             if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        time.sleep(0.2)  # beri kesempatan proses flush stderr sebelum benar-benar mati
+        for proc in (self._ffmpeg_proc, self._adb_proc):
+            if proc is not None and proc.poll() is None:
                 try:
                     proc.kill()
                 except Exception:
@@ -219,40 +280,44 @@ class StreamWorker:
             except Exception as e:
                 with self.lock:
                     self.error = str(e)
+                self._set_status(f"Error: {e}", connecting=True)
             if self._stop:
                 break
-            self._set_status("Stream terputus, menyambung ulang...", connecting=True)
-            time.sleep(1.0)
+            time.sleep(1.5)
 
     def _stream_once(self):
-        self._set_status("Membaca resolusi device...", connecting=True)
-        size = get_device_screen_size()
-        if size is None:
-            self._set_status("Gagal baca resolusi device (adb shell wm size gagal)", connecting=True)
-            time.sleep(2.0)
-            return
-
-        native_w, native_h = size
-        stream_w, stream_h = compute_stream_size(native_w, native_h, self.max_dimension)
+        # Hardware encoder di beberapa device (termasuk yang dites di sini,
+        # Redmi Pad 2) menolak resolusi custom sembarangan untuk H.264
+        # (err=-22 / EINVAL). Saat --size tidak diisi, Android sendiri
+        # otomatis fallback ke 720x1280 (portrait, width x height) waktu
+        # resolusi asli gagal di-encode -- ini dikonfirmasi lewat testing
+        # manual di device ini. Kita pakai ukuran itu persis.
+        stream_w, stream_h = 720, 1280
         frame_size = stream_w * stream_h * 3  # BGR24 = 3 byte per piksel
 
         self._set_status(f"Menghubungkan stream {stream_w}x{stream_h}...", connecting=True)
+        with self.lock:
+            self.connect_start_time = time.time()
+
+        adb_stderr_lines = []
+        ffmpeg_stderr_lines = []
 
         # 1) adb: encode layar device jadi H.264 mentah, stream ke stdout
         adb_cmd = [
-            "adb", "exec-out", "screenrecord",
+            "adb", "-s", self.serial, "exec-out", "screenrecord",
             "--output-format=h264",
             f"--size={stream_w}x{stream_h}",
-            f"--bit-rate={self.bit_rate}",
+            "--bit-rate", str(self.bit_rate),
             "-"
         ]
         self._adb_proc = subprocess.Popen(
-            adb_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            adb_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
+        threading.Thread(target=_drain_stderr, args=(self._adb_proc, adb_stderr_lines), daemon=True).start()
 
         # 2) ffmpeg: decode H.264 -> frame mentah BGR24
         ffmpeg_cmd = [
-            "ffmpeg", "-loglevel", "quiet",
+            "ffmpeg", "-loglevel", "error",
             "-f", "h264", "-i", "pipe:0",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-an", "-sn", "pipe:1"
@@ -261,17 +326,33 @@ class StreamWorker:
             ffmpeg_cmd,
             stdin=self._adb_proc.stdout,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.PIPE
         )
+        threading.Thread(target=_drain_stderr, args=(self._ffmpeg_proc, ffmpeg_stderr_lines), daemon=True).start()
 
         self._set_status("Live", connecting=False)
 
         buffer = b""
         pipe = self._ffmpeg_proc.stdout
+        got_any_frame = False
+        first_frame_event = threading.Event()
+
+        def watchdog():
+            # Link WiFi ADB kamu terukur lambat (~9-10 KB/s), jadi butuh waktu
+            # cukup lama untuk terkumpul cukup data H.264 sebelum ffmpeg bisa
+            # menghasilkan satu frame mentah utuh. Watchdog dinaikkan jadi 40
+            # detik supaya tidak keburu di-kill padahal data sebenarnya masih
+            # mengalir (hanya lambat, bukan macet total).
+            if not first_frame_event.wait(timeout=40.0):
+                self._kill_procs()
+
+        watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        watchdog_thread.start()
+
         while not self._stop:
             chunk = pipe.read(frame_size - len(buffer))
             if not chunk:
-                break  # stream berakhir (screenrecord kena limit waktu / device disconnect)
+                break  # stream berakhir (normal, error, atau kena watchdog kill)
             buffer += chunk
             if len(buffer) >= frame_size:
                 frame = np.frombuffer(buffer[:frame_size], dtype="uint8").reshape((stream_h, stream_w, 3))
@@ -280,8 +361,22 @@ class StreamWorker:
                     self.last_update_time = time.time()
                     self.error = None
                 buffer = b""
+                got_any_frame = True
+                first_frame_event.set()
+                with self.lock:
+                    self.connect_start_time = None
 
         self._kill_procs()
+        time.sleep(0.3)  # beri waktu thread stderr menangkap baris terakhir
+
+        if not got_any_frame:
+            diag = (adb_stderr_lines[-5:] or []) + (ffmpeg_stderr_lines[-5:] or [])
+            diag_text = " | ".join(diag) if diag else "tidak ada output error (silent failure)"
+            with self.lock:
+                self.error = diag_text
+            self._set_status(f"Gagal mulai stream: {diag_text[:120]}", connecting=True)
+        else:
+            self._set_status("Stream terputus, menyambung ulang...", connecting=True)
 
     def snapshot(self):
         with self.lock:
@@ -291,6 +386,7 @@ class StreamWorker:
                 self.is_connecting,
                 self.status_message,
                 self.error,
+                self.connect_start_time,
             )
 
 
@@ -332,7 +428,8 @@ def draw_hacker_hud(frame, fps, is_connecting, status_message):
 
 def main():
     banner()
-    check_wireless_adb()
+    device_serial = check_wireless_adb()
+    print_device_info(device_serial)
 
     if shutil.which("ffmpeg") is None:
         log("FATAL", "ffmpeg tidak ditemukan. Install dulu: sudo apt install ffmpeg", RED)
@@ -346,18 +443,25 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 480, 854)
 
-    worker = StreamWorker(max_dimension=720, bit_rate="8M")
+    worker = StreamWorker(device_serial, max_dimension=720, bit_rate=8_000_000)
     worker.start()
 
     last_window_size = (480, 854)
     placeholder = np.zeros((854, 480, 3), dtype="uint8")
     last_frame_time = time.time()
     fps = 0.0
+    last_logged_error = None
 
     try:
         while True:
-            frame, last_update_time, is_connecting, status_message, error = worker.snapshot()
+            frame, last_update_time, is_connecting, status_message, error, connect_start_time = worker.snapshot()
             now = time.time()
+
+            if error and error != last_logged_error:
+                log("ERROR", f"Stream gagal: {error}", RED)
+                last_logged_error = error
+            elif not error:
+                last_logged_error = None
 
             if frame is not None:
                 dt = now - last_frame_time
@@ -367,10 +471,16 @@ def main():
                 display = frame
             else:
                 display = placeholder.copy()
-                text = status_message
-                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-                cv2.putText(display, text, ((display.shape[1] - tw) // 2, display.shape[0] // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 220, 255), 1, cv2.LINE_AA)
+                # Tampilkan status/error, ditambah hitungan detik nunggu kalau lagi connecting
+                base_text = error if error else status_message
+                if connect_start_time is not None:
+                    elapsed = now - connect_start_time
+                    base_text = f"{base_text} ({elapsed:.0f}s)"
+                text = (base_text[:70] + "...") if len(base_text) > 70 else base_text
+                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.putText(display, text, (max(10, (display.shape[1] - tw) // 2), display.shape[0] // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (60, 60, 255) if error else (60, 220, 255), 1, cv2.LINE_AA)
 
             frame_hud = draw_hacker_hud(display, fps, is_connecting, status_message)
 
